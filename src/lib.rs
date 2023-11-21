@@ -1,428 +1,206 @@
+pub mod avl_tree;
+pub mod interval;
+pub mod interval_tree;
+
 use std::{
-    cmp::{max, Ordering},
-    iter::FromIterator,
-    mem,
-    ops::Not,
+    collections::HashMap,
+    ops::{Deref, DerefMut},
 };
 
-/// An internal node of an `AVLTree`.
-#[derive(Debug)]
-struct AVLNode<T: Ord> {
-    value: T,
-    height: usize,
-    left: Option<Box<AVLNode<T>>>,
-    right: Option<Box<AVLNode<T>>>,
+use interval::Interval;
+use interval_tree::IntervalTree;
+use wasm_bindgen::prelude::*;
+
+use serde_json::Value;
+
+use wasm_bindgen::prelude::*;
+
+// How do we batch our computations?
+// Can we just upfront generate a datastructure which organises the intervals sequentially?
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(
+    Error, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize,
+)]
+pub enum JsIntervalTreeError {
+    #[error(transparent)]
+    IntervalError(#[from] crate::interval::IntervalError),
 }
 
-/// A set based on an AVL Tree.
-///
-/// An AVL Tree is a self-balancing binary search tree. It tracks the height of each node
-/// and performs internal rotations to maintain a height difference of at most 1 between
-/// each sibling pair.
-#[derive(Debug)]
-pub struct AVLTree<T: Ord> {
-    root: Option<Box<AVLNode<T>>>,
-    length: usize,
-}
-
-/// Refers to the left or right subtree of an `AVLNode`.
-#[derive(Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-}
-
-impl<T: Ord> AVLTree<T> {
-    /// Creates an empty `AVLTree`.
-    pub fn new() -> AVLTree<T> {
-        AVLTree {
-            root: None,
-            length: 0,
-        }
-    }
-
-    /// Returns `true` if the tree contains a value.
-    pub fn contains(&self, value: &T) -> bool {
-        let mut current = &self.root;
-        while let Some(node) = current {
-            current = match value.cmp(&node.value) {
-                Ordering::Equal => return true,
-                Ordering::Less => &node.left,
-                Ordering::Greater => &node.right,
+impl From<JsIntervalTreeError> for JsValue {
+    fn from(value: JsIntervalTreeError) -> Self {
+        match value {
+            JsIntervalTreeError::IntervalError(err) => {
+                JsValue::from_str(&format!("IntervalError: {}", err))
             }
         }
-        false
-    }
-
-    /// Adds a value to the tree.
-    ///
-    /// Returns `true` if the tree did not yet contain the value.
-    pub fn insert(&mut self, value: T) -> bool {
-        let inserted = insert(&mut self.root, value);
-        if inserted {
-            self.length += 1;
-        }
-        inserted
-    }
-
-    /// Removes a value from the tree.
-    ///
-    /// Returns `true` if the tree contained the value.
-    pub fn remove(&mut self, value: &T) -> bool {
-        let removed = remove(&mut self.root, value);
-        if removed {
-            self.length -= 1;
-        }
-        removed
-    }
-
-    /// Returns the number of values in the tree.
-    pub fn len(&self) -> usize {
-        self.length
-    }
-
-    /// Returns `true` if the tree contains no values.
-    pub fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-
-    /// Returns an iterator that visits the nodes in the tree in order.
-    fn node_iter(&self) -> NodeIter<T> {
-        let cap = self.root.as_ref().map_or(0, |n| n.height);
-        let mut node_iter = NodeIter {
-            stack: Vec::with_capacity(cap),
-        };
-        // Initialize stack with path to leftmost child
-        let mut child = &self.root;
-        while let Some(node) = child {
-            node_iter.stack.push(node.as_ref());
-            child = &node.left;
-        }
-        node_iter
-    }
-
-    /// Returns an iterator that visits the values in the tree in ascending order.
-    pub fn iter(&self) -> Iter<T> {
-        Iter {
-            node_iter: self.node_iter(),
-        }
     }
 }
 
-/// Recursive helper function for `AVLTree` insertion.
-fn insert<T: Ord>(tree: &mut Option<Box<AVLNode<T>>>, value: T) -> bool {
-    if let Some(node) = tree {
-        let inserted = match value.cmp(&node.value) {
-            Ordering::Equal => false,
-            Ordering::Less => insert(&mut node.left, value),
-            Ordering::Greater => insert(&mut node.right, value),
-        };
-        if inserted {
-            node.rebalance();
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct JsInterval {
+    start: i32,
+    end: i32,
+}
+impl From<Interval<i32>> for JsInterval {
+    fn from(value: Interval<i32>) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
         }
-        inserted
-    } else {
-        *tree = Some(Box::new(AVLNode {
-            value,
-            height: 1,
-            left: None,
-            right: None,
-        }));
-        true
+    }
+}
+impl TryFrom<JsInterval> for Interval<i32> {
+    type Error = crate::interval::IntervalError;
+    fn try_from(value: JsInterval) -> Result<Self, Self::Error> {
+        let iv = Interval::new(value.start..value.end)?;
+        Ok(iv)
     }
 }
 
-/// Recursive helper function for `AVLTree` deletion.
-fn remove<T: Ord>(tree: &mut Option<Box<AVLNode<T>>>, value: &T) -> bool {
-    if let Some(node) = tree {
-        let removed = match value.cmp(&node.value) {
-            Ordering::Less => remove(&mut node.left, value),
-            Ordering::Greater => remove(&mut node.right, value),
-            Ordering::Equal => {
-                *tree = match (node.left.take(), node.right.take()) {
-                    (None, None) => None,
-                    (Some(b), None) | (None, Some(b)) => Some(b),
-                    (Some(left), Some(right)) => Some(merge(left, right)),
-                };
-                return true;
+#[wasm_bindgen]
+impl JsInterval {
+    #[wasm_bindgen(constructor)]
+    pub fn new(start: i32, end: i32) -> Self {
+        Self { start, end }
+    }
+    #[wasm_bindgen(getter)]
+    pub fn start(&self) -> i32 {
+        self.start
+    }
+    #[wasm_bindgen(getter)]
+    pub fn end(&self) -> i32 {
+        self.end
+    }
+}
+
+#[wasm_bindgen]
+pub struct JsIntervalTree(IntervalTree<i32, JsValue>);
+
+impl From<IntervalTree<i32, JsValue>> for JsIntervalTree {
+    fn from(value: IntervalTree<i32, JsValue>) -> Self {
+        Self(value)
+    }
+}
+
+// impl Deref for JsIntervalTree {
+//     type Target = IntervalTree<i32, Value>;
+//     fn deref(&self) -> &Self::Target {
+//         &self.0
+//     }
+// }
+
+// impl DerefMut for JsIntervalTree {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.0
+//     }
+// }
+
+#[wasm_bindgen]
+#[derive(Serialize, Deserialize)]
+pub struct JsIntervalData {
+    interval: JsInterval,
+    #[serde(skip)]
+    data: JsValue,
+}
+
+#[wasm_bindgen]
+impl JsIntervalData {
+    #[wasm_bindgen(getter)]
+    pub fn interval(&self) -> JsInterval {
+        self.interval
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> JsValue {
+        self.data.clone()
+    }
+}
+
+#[wasm_bindgen]
+pub struct JsBatchedIntervalData(HashMap<JsInterval, Vec<JsIntervalData>>);
+
+impl From<HashMap<JsInterval, Vec<JsIntervalData>>> for JsBatchedIntervalData {
+    fn from(value: HashMap<JsInterval, Vec<JsIntervalData>>) -> Self {
+        JsBatchedIntervalData(value)
+    }
+}
+
+#[wasm_bindgen]
+impl JsBatchedIntervalData {
+    #[wasm_bindgen(getter)]
+    pub fn batch(&self) -> Result<JsValue, JsValue> {
+        Ok(serde_wasm_bindgen::to_value(&self.0)?)
+    }
+
+    // pub fn query_cache(&mut self, iv: JsInterval) -> Option<Vec<JsIntervalData>> {
+    //     let res = self.0.get(&iv).map(ToOwned::to_owned);
+
+    // }
+}
+
+#[wasm_bindgen]
+impl JsIntervalTree {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> JsIntervalTree {
+        IntervalTree::<i32, JsValue>::new().into()
+    }
+    #[wasm_bindgen]
+    pub fn insert(&mut self, iv: JsInterval, data: JsValue) -> Result<(), JsIntervalTreeError> {
+        let iv = Interval::try_from(iv)?;
+
+        self.0.insert(iv, data);
+
+        Ok(())
+    }
+    #[wasm_bindgen]
+    pub fn find(&self, iv: JsInterval) -> Result<Vec<JsIntervalData>, JsIntervalTreeError> {
+        let iv = Interval::try_from(iv)?;
+
+        let entries = self
+            .0
+            .find(iv)
+            .map(|entry| {
+                let iv = entry.interval();
+
+                JsIntervalData {
+                    interval: iv.clone().into(),
+                    data: entry.data().clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(entries)
+    }
+    #[wasm_bindgen]
+    pub fn batch_find(
+        &self,
+        intervals: Vec<i32>,
+    ) -> Result<JsBatchedIntervalData, JsIntervalTreeError> {
+        let mut cache = HashMap::<JsInterval, Vec<JsIntervalData>>::new();
+
+        for window in intervals.windows(2) {
+            match window {
+                [start, end, ..] => {
+                    let iv = JsInterval {
+                        start: *start,
+                        end: *end,
+                    };
+                    let entry = self.find(iv);
+
+                    match entry {
+                        Ok(entry) => {
+                            cache.insert(iv, entry);
+                        }
+                        Err(err) => {}
+                    }
+                }
+                _ => {}
             }
-        };
-        if removed {
-            node.rebalance();
         }
-        removed
-    } else {
-        false
-    }
-}
-
-/// Merges two trees and returns the root of the merged tree.
-fn merge<T: Ord>(left: Box<AVLNode<T>>, right: Box<AVLNode<T>>) -> Box<AVLNode<T>> {
-    let mut op_right = Some(right);
-    // Guaranteed not to panic since right has at least one node
-    let mut root = take_min(&mut op_right).unwrap();
-    root.left = Some(left);
-    root.right = op_right;
-    root.rebalance();
-    root
-}
-
-/// Removes the smallest node from the tree, if one exists.
-fn take_min<T: Ord>(tree: &mut Option<Box<AVLNode<T>>>) -> Option<Box<AVLNode<T>>> {
-    if let Some(mut node) = tree.take() {
-        // Recurse along the left side
-        if let Some(small) = take_min(&mut node.left) {
-            // Took the smallest from below; update this node and put it back in the tree
-            node.rebalance();
-            *tree = Some(node);
-            Some(small)
-        } else {
-            // Take this node and replace it with its right child
-            *tree = node.right.take();
-            Some(node)
-        }
-    } else {
-        None
-    }
-}
-
-impl<T: Ord> AVLNode<T> {
-    /// Returns a reference to the left or right child.
-    fn child(&self, side: Side) -> &Option<Box<AVLNode<T>>> {
-        match side {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
-        }
-    }
-
-    /// Returns a mutable reference to the left or right child.
-    fn child_mut(&mut self, side: Side) -> &mut Option<Box<AVLNode<T>>> {
-        match side {
-            Side::Left => &mut self.left,
-            Side::Right => &mut self.right,
-        }
-    }
-
-    /// Returns the height of the left or right subtree.
-    fn height(&self, side: Side) -> usize {
-        self.child(side).as_ref().map_or(0, |n| n.height)
-    }
-
-    /// Returns the height difference between the left and right subtrees.
-    fn balance_factor(&self) -> i8 {
-        let (left, right) = (self.height(Side::Left), self.height(Side::Right));
-        if left < right {
-            (right - left) as i8
-        } else {
-            -((left - right) as i8)
-        }
-    }
-
-    /// Recomputes the `height` field.
-    fn update_height(&mut self) {
-        self.height = 1 + max(self.height(Side::Left), self.height(Side::Right));
-    }
-
-    /// Performs a left or right rotation.
-    fn rotate(&mut self, side: Side) {
-        let mut subtree = self.child_mut(!side).take().unwrap();
-        *self.child_mut(!side) = subtree.child_mut(side).take();
-        self.update_height();
-        // Swap root and child nodes in memory
-        mem::swap(self, subtree.as_mut());
-        // Set old root (subtree) as child of new root (self)
-        *self.child_mut(side) = Some(subtree);
-        self.update_height();
-    }
-
-    /// Performs left or right tree rotations to balance this node.
-    fn rebalance(&mut self) {
-        self.update_height();
-        let side = match self.balance_factor() {
-            -2 => Side::Left,
-            2 => Side::Right,
-            _ => return,
-        };
-        let subtree = self.child_mut(side).as_mut().unwrap();
-        // Left-Right and Right-Left require rotation of heavy subtree
-        if let (Side::Left, 1) | (Side::Right, -1) = (side, subtree.balance_factor()) {
-            subtree.rotate(side);
-        }
-        // Rotate in opposite direction of heavy side
-        self.rotate(!side);
-    }
-}
-
-impl<T: Ord> Default for AVLTree<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Not for Side {
-    type Output = Side;
-
-    fn not(self) -> Self::Output {
-        match self {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
-        }
-    }
-}
-
-impl<T: Ord> FromIterator<T> for AVLTree<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut tree = AVLTree::new();
-        for value in iter {
-            tree.insert(value);
-        }
-        tree
-    }
-}
-
-/// An iterator over the nodes of an `AVLTree`.
-///
-/// This struct is created by the `node_iter` method of `AVLTree`.
-struct NodeIter<'a, T: Ord> {
-    stack: Vec<&'a AVLNode<T>>,
-}
-
-impl<'a, T: Ord> Iterator for NodeIter<'a, T> {
-    type Item = &'a AVLNode<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(node) = self.stack.pop() {
-            // Push left path of right subtree to stack
-            let mut child = &node.right;
-            while let Some(subtree) = child {
-                self.stack.push(subtree.as_ref());
-                child = &subtree.left;
-            }
-            Some(node)
-        } else {
-            None
-        }
-    }
-}
-
-/// An iterator over the items of an `AVLTree`.
-///
-/// This struct is created by the `iter` method of `AVLTree`.
-pub struct Iter<'a, T: Ord> {
-    node_iter: NodeIter<'a, T>,
-}
-
-impl<'a, T: Ord> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<&'a T> {
-        match self.node_iter.next() {
-            Some(node) => Some(&node.value),
-            None => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Label {
-    time: u32,
-    data: String,
-}
-impl Label {
-    fn new(time: u32, data: String) -> Self {
-        Self { time, data }
-    }
-}
-
-impl Ord for Label {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.time.cmp(&other.time)
-    }
-}
-
-impl PartialOrd for Label {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Label {
-    fn eq(&self, other: &Self) -> bool {
-        (self.time, &self.data) == (other.time, &other.data)
-    }
-}
-
-impl Eq for Label {}
-
-#[cfg(test)]
-mod tests {
-    use crate::Label;
-
-    use super::AVLTree;
-
-    /// Returns `true` if all nodes in the tree are balanced.
-    fn is_balanced<T: Ord>(tree: &AVLTree<T>) -> bool {
-        tree.node_iter()
-            .all(|n| (-1..=1).contains(&n.balance_factor()))
-    }
-
-    #[test]
-    fn struct_value() {
-        let mut tree: AVLTree<Label> = AVLTree::new();
-
-        tree.insert(Label::new(3, "three".to_string()));
-        tree.insert(Label::new(1, "one".to_string()));
-        tree.insert(Label::new(4, "four".to_string()));
-        tree.insert(Label::new(2, "two".to_string()));
-
-        println!("{:?}", &tree);
-    }
-
-    #[test]
-    fn len() {
-        let tree: AVLTree<_> = (1..4).collect();
-
-        assert_eq!(tree.len(), 3);
-    }
-
-    #[test]
-    fn contains() {
-        let tree: AVLTree<_> = (1..4).collect();
-        assert!(tree.contains(&1));
-        assert!(!tree.contains(&4));
-    }
-
-    #[test]
-    fn insert() {
-        let mut tree = AVLTree::new();
-        // First insert succeeds
-        assert!(tree.insert(1));
-        // Second insert fails
-        assert!(!tree.insert(1));
-    }
-
-    #[test]
-    fn remove() {
-        let mut tree: AVLTree<_> = (1..8).collect();
-        // First remove succeeds
-        assert!(tree.remove(&4));
-        // Second remove fails
-        assert!(!tree.remove(&4));
-    }
-
-    #[test]
-    fn sorted() {
-        let tree: AVLTree<_> = (1..8).rev().collect();
-        assert!((1..8).eq(tree.iter().copied()));
-    }
-
-    #[test]
-    fn balanced() {
-        let mut tree: AVLTree<_> = (1..8).collect();
-        assert!(is_balanced(&tree));
-        for x in 1..8 {
-            tree.remove(&x);
-            assert!(is_balanced(&tree));
-        }
+        Ok(cache.into())
     }
 }
